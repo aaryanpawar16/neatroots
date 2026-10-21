@@ -70,6 +70,8 @@ interface LiveRun {
   planning?: Promise<void>;
   used: { plans: number; investigations: number; notes: number; summaries: number };
   deferred: (() => Promise<void>)[];
+  /** Triage of raised findings still deciding whether to queue an investigation; the end pass waits for it. */
+  triaging: Set<Promise<unknown>>;
   spanDone: Set<string>;
   /** Per span-scope check: spans waiting to be asked about, newest last. */
   spanQueue: Map<string, string[]>;
@@ -255,6 +257,7 @@ export class Engine {
       workflow: row.workflow ?? row.project ?? "unknown",
       used: { plans: 0, investigations: 0, notes: 0, summaries: 0 },
       deferred: [],
+      triaging: new Set(),
       spanDone: new Set(),
       spanQueue: new Map(),
       spanBusy: new Set(),
@@ -757,7 +760,9 @@ export class Engine {
       });
       this.roots.bus.emit("note", note);
     }
-    void this.track(run.traceId, this.triage(run, f));
+    const triage = this.track(run.traceId, this.triage(run, f));
+    run.triaging.add(triage);
+    void triage.finally(() => run.triaging.delete(triage));
     void snap;
   }
 
@@ -1103,8 +1108,13 @@ ${library}`;
     // Deferred investigations await models too, so a hand-back during one leaves the rest for the
     // next pass instead of running them over the callee's slice of the trace. One that fails (a
     // model error) is skipped: it must not take the rest, the summary or the release with it.
-    let pending = run.deferred.splice(0);
-    while (pending.length) {
+    for (;;) {
+      // Triage of the findings raised during this pass may still be deciding whether to queue an
+      // investigation; wait for it so what it queues is in this drain, not left behind.
+      while (run.triaging.size) await Promise.all([...run.triaging]);
+      if (stale()) return;
+      const pending = run.deferred.splice(0);
+      if (!pending.length) break;
       let next = 0;
       for (; next < pending.length; next++) {
         if (stale()) break;
@@ -1116,8 +1126,6 @@ ${library}`;
       }
       run.deferred.push(...pending.slice(next));
       if (stale()) return;
-      // Work queued while this ran (a finding triaged late) gets its turn too.
-      pending = run.deferred.splice(0);
     }
     try {
       await this.summarize(run, snap, stale);

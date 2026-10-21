@@ -580,6 +580,52 @@ rule:
     await until(() => tb.roots.store.getSummary(t), 10_000);
   });
 
+  it("runs an investigation whose triage is still deciding when the end pass reaches its drain", async () => {
+    const llm = await mockLlm();
+    // No investigations budget, so the finding queues its investigation once its triage has decided.
+    const tb = await makeRoots({ llmUrl: llm.url, config: (c) => (c.budgets.investigationsPerRun = 0) });
+    cleanup.push(async () => {
+      await tb.close();
+      await llm.close();
+    });
+    const rule = checkFromInput(`
+id: boom-slow
+kind: rule
+title: A problem worth investigating
+rule:
+  type: match
+  field: input
+  pattern: BOOM
+  span:
+    type: workflow
+`).check;
+    if (!rule) throw new Error("rule did not parse");
+    tb.roots.checks.save(rule, "user");
+    const engine = tb.roots.engine as unknown as { decisions: { decide: (...a: unknown[]) => Promise<unknown> } };
+    const real = engine.decisions.decide.bind(engine.decisions);
+    engine.decisions.decide = async (...args: unknown[]) => {
+      const qs = args[1] as { name?: string }[] | undefined;
+      if (qs?.some((q) => q.name === "triage")) {
+        await new Promise((r) => setTimeout(r, 1500)); // the end pass (debounced 400 ms, then a few model calls) is done well before this
+        return { answers: { triage: { score: 3 } }, backend: "test", model: "test" };
+      }
+      return real(...args);
+    };
+    const client = tb.roots.llm as unknown as { chat: (...a: unknown[]) => Promise<unknown>; isAvailable: () => Promise<boolean> };
+    client.isAvailable = async () => true;
+    const realChat = client.chat.bind(tb.roots.llm);
+    let investigations = 0;
+    client.chat = async (...args: unknown[]) => {
+      if ((args[1] as { schema?: { name?: string } } | undefined)?.schema?.name === "investigation") investigations++;
+      return realChat(...args);
+    };
+    const t = hex(16);
+    tb.roots.ingest([batch([span({ traceId: t, name: "agent", kind: "workflow", attrs: [s("neatlogs.workflow.input", "BOOM happened")] })])]);
+
+    await until(() => investigations >= 1, 10_000);
+    await until(() => tb.roots.store.getSummary(t), 10_000);
+  });
+
   it("does not let a failing whole-run explanation escape the triage of a failed run", async () => {
     const llm = await mockLlm();
     const tb = await makeRoots({ llmUrl: llm.url });
