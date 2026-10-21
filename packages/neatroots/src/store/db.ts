@@ -436,6 +436,7 @@ export class Store {
     this.migrate();
     this.searchIds = new SearchIds(this.db);
     this.blobs = new BlobStore(path.join(dir, "blobs"));
+    this.blobs.reclaimOrphans(() => this.referencedBlobs());
     const row = this.db.prepare("SELECT MAX(seq) AS s FROM spans").get() as { s: number | null };
     this.seq = row.s ?? 0;
   }
@@ -1474,6 +1475,12 @@ export class Store {
     });
     tx();
     this.reclaimUnreferencedBlobs(shas);
+  }
+
+  /** Every blob a stored span refers to. */
+  private referencedBlobs(): Set<string> {
+    const rows = this.db.prepare("SELECT DISTINCT j.value AS sha FROM spans, json_each(CASE WHEN json_valid(spans.blobs) THEN spans.blobs ELSE '[]' END) AS j WHERE spans.blobs IS NOT NULL").all() as { sha: string }[];
+    return new Set(rows.map((r) => r.sha));
   }
 
   /** Deletes candidate payloads only after checking every remaining span reference. */

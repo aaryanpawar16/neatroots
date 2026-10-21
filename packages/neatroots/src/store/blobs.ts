@@ -7,6 +7,12 @@ import type { AnyValue, KeyValue } from "../otlp/types.js";
 /** String attribute values above this size are stored as blob files beside the database. */
 export const BLOB_THRESHOLD = 32 * 1024;
 
+/** An ingest writes its blob files before its span commits, so recent files may not be referenced yet. */
+export const ORPHAN_GRACE_MS = 10 * 60_000;
+
+const FINAL_FILE = /^[0-9a-f]{62}$/;
+const TEMP_FILE = /^[0-9a-f]{62}\.\d+\.[0-9a-f]{8}\.tmp$/;
+
 export interface BlobRef {
   blobRef: { sha: string; len: number };
 }
@@ -75,6 +81,55 @@ export class BlobStore {
       for (const f of fs.readdirSync(p)) total += fs.statSync(path.join(p, f)).size;
     }
     return total;
+  }
+
+  /**
+   * Deletes payload files no span references, and the temporary files an interrupted write leaves behind.
+   * A crash between writing a blob and committing its span leaves such files, and they count toward the size
+   * cap for good. Files changed within `graceMs` are kept. `referenced` is only called when there is
+   * something old enough to judge. Returns how many files were removed.
+   */
+  reclaimOrphans(referenced: () => ReadonlySet<string>, graceMs = ORPHAN_GRACE_MS, now = Date.now()): number {
+    const old: { file: string; sha?: string }[] = [];
+    let shards: string[];
+    try {
+      shards = fs.readdirSync(this.dir);
+    } catch {
+      return 0;
+    }
+    for (const sub of shards) {
+      if (!/^[0-9a-f]{2}$/.test(sub)) continue;
+      const dir = path.join(this.dir, sub);
+      let names: string[];
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        const temp = TEMP_FILE.test(name);
+        if (!temp && !FINAL_FILE.test(name)) continue;
+        const file = path.join(dir, name);
+        try {
+          if (now - fs.statSync(file).mtimeMs >= graceMs) old.push({ file, sha: temp ? undefined : sub + name });
+        } catch {
+          /* gone already */
+        }
+      }
+    }
+    if (!old.length) return 0;
+    const used = referenced();
+    let removed = 0;
+    for (const { file, sha } of old) {
+      if (sha && used.has(sha)) continue;
+      try {
+        fs.unlinkSync(file);
+        removed++;
+      } catch {
+        /* leave it for the next start */
+      }
+    }
+    return removed;
   }
 
   /** Replaces large string values with blob references; returns the shas used. */
