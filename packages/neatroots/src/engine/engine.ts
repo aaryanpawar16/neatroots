@@ -1101,17 +1101,29 @@ ${library}`;
     }
     if (stale()) return;
     // Deferred investigations await models too, so a hand-back during one leaves the rest for the
-    // next pass instead of running them over the callee's slice of the trace.
-    const pending = run.deferred.splice(0);
-    let next = 0;
-    for (; next < pending.length; next++) {
-      if (stale()) break;
-      await pending[next]();
+    // next pass instead of running them over the callee's slice of the trace. One that fails (a
+    // model error) is skipped: it must not take the rest, the summary or the release with it.
+    let pending = run.deferred.splice(0);
+    while (pending.length) {
+      let next = 0;
+      for (; next < pending.length; next++) {
+        if (stale()) break;
+        try {
+          await pending[next]();
+        } catch (err) {
+          log.warn(`investigation for ${run.traceId.slice(0, 8)} failed: ${(err as Error).message}`);
+        }
+      }
+      run.deferred.push(...pending.slice(next));
+      if (stale()) return;
+      // Work queued while this ran (a finding triaged late) gets its turn too.
+      pending = run.deferred.splice(0);
     }
-    run.deferred.push(...pending.slice(next));
-    if (stale()) return;
-    await this.summarize(run, snap, stale);
-    this.scheduleLiveRelease(run);
+    try {
+      await this.summarize(run, snap, stale);
+    } finally {
+      this.scheduleLiveRelease(run);
+    }
   }
 
   /**
@@ -1140,7 +1152,11 @@ ${library}`;
       return;
     }
     run.used.investigations++;
-    await this.explainRun(run.traceId);
+    try {
+      await this.explainRun(run.traceId);
+    } catch (err) {
+      log.warn(`explaining ${run.traceId.slice(0, 8)} failed: ${(err as Error).message}`);
+    }
   }
 
   /** Explains a whole run: likely cause, the spans that show it, and a fix. */
