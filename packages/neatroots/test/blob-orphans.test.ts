@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ORPHAN_GRACE_MS } from "../src/store/blobs.js";
 import { Store } from "../src/store/db.js";
@@ -86,5 +87,44 @@ describe("blob files left by an interrupted ingest", () => {
     new Store(dir).close();
     expect(fs.existsSync(stray)).toBe(true);
     expect(fs.existsSync(strayShard)).toBe(true);
+  });
+
+  it("are not swept while another connection holds the write lock, as an ingest does between its blob writes and its commit", () => {
+    const dir = dataDir();
+    const st = new Store(dir);
+    const orphan = fileOf(st, st.blobs.put(big("old orphan")));
+    age(orphan);
+    const sweep = () => (st as unknown as { reclaimOrphanBlobs(): void }).reclaimOrphanBlobs();
+    // An ingest in flight: it holds the write lock, and its batch is about to reuse the old payload.
+    const ingest = new Database(st.file);
+    ingest.exec("BEGIN IMMEDIATE");
+
+    sweep(); // must give up, not read references and delete under the ingest
+    expect(fs.existsSync(orphan)).toBe(true);
+
+    ingest.exec("COMMIT");
+    ingest.close();
+    sweep(); // nothing holds the lock now
+    expect(fs.existsSync(orphan)).toBe(false);
+    st.close();
+  });
+
+  it("do not follow a shard that is a symlink out of the store", (ctx) => {
+    const dir = dataDir();
+    const st = new Store(dir);
+    const elsewhere = path.join(path.dirname(dir), "elsewhere");
+    fs.mkdirSync(elsewhere);
+    const victim = path.join(elsewhere, "a".repeat(62));
+    fs.writeFileSync(victim, "not this store's");
+    age(victim);
+    try {
+      fs.symlinkSync(elsewhere, path.join(dir, "blobs", "ab"), "dir");
+    } catch {
+      ctx.skip(); // no permission to create symlinks here
+    }
+    st.close();
+
+    new Store(dir).close();
+    expect(fs.existsSync(victim)).toBe(true);
   });
 });

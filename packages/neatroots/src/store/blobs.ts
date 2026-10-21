@@ -86,39 +86,40 @@ export class BlobStore {
   /**
    * Deletes payload files no span references, and the temporary files an interrupted write leaves behind.
    * A crash between writing a blob and committing its span leaves such files, and they count toward the size
-   * cap for good. Files changed within `graceMs` are kept. `referenced` is only called when there is
-   * something old enough to judge. Returns how many files were removed.
+   * cap for good. Files changed within `graceMs` are kept. Returns how many files were removed.
    */
   reclaimOrphans(referenced: () => ReadonlySet<string>, graceMs = ORPHAN_GRACE_MS, now = Date.now()): number {
     const old: { file: string; sha?: string }[] = [];
-    let shards: string[];
+    let shards: fs.Dirent[];
     try {
-      shards = fs.readdirSync(this.dir);
+      shards = fs.readdirSync(this.dir, { withFileTypes: true });
     } catch {
       return 0;
     }
-    for (const sub of shards) {
-      if (!/^[0-9a-f]{2}$/.test(sub)) continue;
-      const dir = path.join(this.dir, sub);
-      let names: string[];
+    for (const shard of shards) {
+      // A symlinked shard could lead out of this store, so only real directories and files are looked at.
+      if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue;
+      const dir = path.join(this.dir, shard.name);
+      let entries: fs.Dirent[];
       try {
-        names = fs.readdirSync(dir);
+        entries = fs.readdirSync(dir, { withFileTypes: true });
       } catch {
         continue;
       }
-      for (const name of names) {
-        const temp = TEMP_FILE.test(name);
-        if (!temp && !FINAL_FILE.test(name)) continue;
-        const file = path.join(dir, name);
+      for (const entry of entries) {
+        const temp = TEMP_FILE.test(entry.name);
+        if (!entry.isFile() || (!temp && !FINAL_FILE.test(entry.name))) continue;
+        const file = path.join(dir, entry.name);
         try {
-          if (now - fs.statSync(file).mtimeMs >= graceMs) old.push({ file, sha: temp ? undefined : sub + name });
+          if (now - fs.statSync(file).mtimeMs >= graceMs) old.push({ file, sha: temp ? undefined : shard.name + entry.name });
         } catch {
           /* gone already */
         }
       }
     }
     if (!old.length) return 0;
-    const used = referenced();
+    // A temporary file is never referenced, so the database is only read when a payload file is old enough to judge.
+    const used = old.some((o) => o.sha) ? referenced() : new Set<string>();
     let removed = 0;
     for (const { file, sha } of old) {
       if (sha && used.has(sha)) continue;

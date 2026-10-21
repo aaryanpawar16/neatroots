@@ -383,6 +383,8 @@ export function currentRequest(v: Parameters<typeof preview>[0]): string | undef
 /** Search covers this much of each input, output and error: the start and the end of long values. */
 export const SEARCH_LIMIT = { head: 150_000, tail: 50_000 };
 const SEARCH_INDEX_VERSION = 2;
+/** How long a statement waits for another connection's write lock. */
+const BUSY_TIMEOUT_MS = 5000;
 /** A store over its size cap is trimmed to this share of the cap, so it isn't trimmed every hour. */
 export const RETENTION_LOW_WATER = 0.9;
 
@@ -431,12 +433,12 @@ export class Store {
     this.db = new Database(this.file);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
-    this.db.pragma("busy_timeout = 5000");
+    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.db.exec(SCHEMA);
     this.migrate();
     this.searchIds = new SearchIds(this.db);
     this.blobs = new BlobStore(path.join(dir, "blobs"));
-    this.blobs.reclaimOrphans(() => this.referencedBlobs());
+    this.reclaimOrphanBlobs();
     const row = this.db.prepare("SELECT MAX(seq) AS s FROM spans").get() as { s: number | null };
     this.seq = row.s ?? 0;
   }
@@ -1475,6 +1477,22 @@ export class Store {
     });
     tx();
     this.reclaimUnreferencedBlobs(shas);
+  }
+
+  /**
+   * An ingest takes the database write lock with its first statement, writes its blob files, and commits. Sweeping under
+   * the same lock means no ingest is halfway through (or about to reuse an old payload) while the references are read and
+   * files are deleted. If another process holds the lock the sweep is skipped; the next start tries again.
+   */
+  private reclaimOrphanBlobs(): void {
+    this.db.pragma("busy_timeout = 250");
+    try {
+      this.db.transaction(() => this.blobs.reclaimOrphans(() => this.referencedBlobs())).immediate();
+    } catch {
+      /* busy or unreadable: best effort */
+    } finally {
+      this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    }
   }
 
   /** Every blob a stored span refers to. */
