@@ -1485,9 +1485,12 @@ export class Store {
    * files are deleted. If another process holds the lock the sweep is skipped; the next start tries again.
    */
   private reclaimOrphanBlobs(): void {
+    // The directory walk needs no lock; only reading the references and deleting do.
+    const candidates = this.blobs.findOrphanCandidates();
+    if (!candidates.length) return;
     this.db.pragma("busy_timeout = 250");
     try {
-      this.db.transaction(() => this.blobs.reclaimOrphans(() => this.referencedBlobs())).immediate();
+      this.db.transaction(() => this.blobs.reclaimCandidates(candidates, () => this.referencedBlobs())).immediate();
     } catch {
       /* busy or unreadable: best effort */
     } finally {

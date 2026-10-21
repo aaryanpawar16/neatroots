@@ -13,6 +13,12 @@ export const ORPHAN_GRACE_MS = 10 * 60_000;
 const FINAL_FILE = /^[0-9a-f]{62}$/;
 const TEMP_FILE = /^[0-9a-f]{62}\.\d+\.[0-9a-f]{8}\.tmp$/;
 
+export interface OrphanCandidate {
+  file: string;
+  /** Set for a payload file; a temporary file has none. */
+  sha?: string;
+}
+
 export interface BlobRef {
   blobRef: { sha: string; len: number };
 }
@@ -84,17 +90,17 @@ export class BlobStore {
   }
 
   /**
-   * Deletes payload files no span references, and the temporary files an interrupted write leaves behind.
-   * A crash between writing a blob and committing its span leaves such files, and they count toward the size
-   * cap for good. Files changed within `graceMs` are kept. Returns how many files were removed.
+   * Payload and temporary files old enough to be left over from an interrupted ingest: a crash between writing a blob
+   * and committing its span leaves them, and they count toward the size cap for good. Files changed within `graceMs`
+   * are not candidates. Whether a payload file is still referenced is for `reclaimCandidates` to check.
    */
-  reclaimOrphans(referenced: () => ReadonlySet<string>, graceMs = ORPHAN_GRACE_MS, now = Date.now()): number {
-    const old: { file: string; sha?: string }[] = [];
+  findOrphanCandidates(graceMs = ORPHAN_GRACE_MS, now = Date.now()): OrphanCandidate[] {
+    const found: OrphanCandidate[] = [];
     let shards: fs.Dirent[];
     try {
       shards = fs.readdirSync(this.dir, { withFileTypes: true });
     } catch {
-      return 0;
+      return found;
     }
     for (const shard of shards) {
       // A symlinked shard could lead out of this store, so only real directories and files are looked at.
@@ -111,17 +117,24 @@ export class BlobStore {
         if (!entry.isFile() || (!temp && !FINAL_FILE.test(entry.name))) continue;
         const file = path.join(dir, entry.name);
         try {
-          if (now - fs.statSync(file).mtimeMs >= graceMs) old.push({ file, sha: temp ? undefined : shard.name + entry.name });
+          if (now - fs.statSync(file).mtimeMs >= graceMs) found.push({ file, sha: temp ? undefined : shard.name + entry.name });
         } catch {
           /* gone already */
         }
       }
     }
-    if (!old.length) return 0;
-    // A temporary file is never referenced, so the database is only read when a payload file is old enough to judge.
-    const used = old.some((o) => o.sha) ? referenced() : new Set<string>();
+    return found;
+  }
+
+  /**
+   * Deletes the candidates no span references, and every temporary file. `referenced` is only called when a payload file
+   * needs judging. Returns how many files were removed.
+   */
+  reclaimCandidates(candidates: readonly OrphanCandidate[], referenced: () => ReadonlySet<string>): number {
+    if (!candidates.length) return 0;
+    const used = candidates.some((c) => c.sha) ? referenced() : new Set<string>();
     let removed = 0;
-    for (const { file, sha } of old) {
+    for (const { file, sha } of candidates) {
       if (sha && used.has(sha)) continue;
       try {
         fs.unlinkSync(file);
