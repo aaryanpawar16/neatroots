@@ -17,9 +17,10 @@ export function missingBlobNotice(ref: BlobRef["blobRef"]): string {
   return `[neatroots: the ${ref.len}-character payload ${ref.sha.slice(0, 12)} is missing from the blob store]`;
 }
 
-export class BlobStore {
-  private readonly reportedMissing = new Set<string>();
+/** Payloads already reported missing in this process, so a page load or a second store does not repeat the warning. */
+const reportedMissing = new Set<string>();
 
+export class BlobStore {
   constructor(private readonly dir: string) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -111,9 +112,8 @@ export class BlobStore {
     if (ref) {
       const text = this.get(ref.sha);
       if (text !== undefined) return { stringValue: text };
-      // Reads happen on every page load; say it once per payload.
-      if (!this.reportedMissing.has(ref.sha)) {
-        this.reportedMissing.add(ref.sha);
+      if (!reportedMissing.has(ref.sha)) {
+        reportedMissing.add(ref.sha);
         log.warn(`payload ${ref.sha.slice(0, 12)} (${ref.len} characters) is missing from the blob store; reads show a placeholder`);
       }
       return { stringValue: missingBlobNotice(ref) };
